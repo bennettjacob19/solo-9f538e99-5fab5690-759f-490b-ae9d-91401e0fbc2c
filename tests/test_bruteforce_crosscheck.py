@@ -1,126 +1,111 @@
-"""用独立的暴力枚举器交叉验证记忆化 DFS 求解器的结论。
+"""独立暴力复算交叉验证：不依赖引擎聚合，直接逐样本逐档重算区间 MSE。
 
-暴力枚举器不共享求解器代码：直接枚举每个空档的全部合法动作序列，
-按评测点累计回滚重跑，检查所有预算。仅在小规模（<=6 批、<=2 场）运行。
+复算逻辑与 :mod:`app.calibration` 完全独立：只从引擎取出已受理的原始
+样本（测试侧核对用途）和检查点库权重，自行过滤负载闭区间、逐档计算
+MSE，验证选档、并列容差、预测值与实读条数全部吻合。
 """
 
-import itertools
-import random
+from __future__ import annotations
 
-from app.scheduler import (
-    CHECKPOINT_SECONDS,
-    EvaluationSpec,
-    solve,
-)
+import math
+
+from app import ml
 
 
-def brute_force(durations, evals, max_cp, max_rerun):
-    """返回 (feasible, min_reruns, min_checkpoints)。"""
-    n = len(durations)
-    evals = sorted(evals, key=lambda e: e.start)
-    best = None  # (reruns, cps)
-
-    def fill_gap(x, gap_end, cur, peak, last_cp, cp_used, reruns_used,
-                 pending_evals, history):
-        nonlocal best
-        if not pending_evals:
-            # 末段顺序训完，不再存档。
-            t = x
-            c = cur
-            while c < n:
-                t += durations[c]
-                c += 1
-            best = (reruns_used, cp_used) if best is None else min(
-                best, (reruns_used, cp_used)
-            )
-            return
-
-        spec = pending_evals[0]
-        if x == gap_end:
-            # 评测点：检查最低存档批次并回滚。
-            if last_cp < spec.min_checkpoint_batches:
-                return
-            rolled = cur - last_cp
-            if reruns_used + rolled > max_rerun:
-                return
-            rest = pending_evals[1:]
-            next_end = rest[0].start if rest else None
-            if rest:
-                fill_gap(spec.end, next_end, last_cp, peak, last_cp,
-                         cp_used, reruns_used + rolled, rest, history)
-            else:
-                fill_gap(spec.end, None, last_cp, peak, last_cp, cp_used,
-                         reruns_used + rolled, [], history)
-            return
-
-        can_train = cur < n and x + durations[cur] <= gap_end
-        can_cp = (x + CHECKPOINT_SECONDS <= gap_end
-                  and cp_used < max_cp and last_cp < cur)
-
-        if can_train:
-            fill_gap(x + durations[cur], gap_end, cur + 1,
-                     max(peak, cur + 1), last_cp, cp_used, reruns_used,
-                     pending_evals, history)
-            if can_cp:
-                fill_gap(x + CHECKPOINT_SECONDS, gap_end, cur, peak, cur,
-                         cp_used + 1, reruns_used, pending_evals, history)
-            return
-        if can_cp:
-            fill_gap(x + CHECKPOINT_SECONDS, gap_end, cur, peak, cur,
-                     cp_used + 1, reruns_used, pending_evals, history)
-        # 空闲到空档结束（仅在没有可行动作时合法）。
-        fill_gap(gap_end, gap_end, cur, peak, last_cp, cp_used,
-                 reruns_used, pending_evals, history)
-
-    fill_gap(0, evals[0].start, 0, 0, 0, 0, 0, evals, [])
-    return (best is not None, *best) if best is not None else (False, None, None)
+def _brute_force_select(store, load_start, load_end, features):
+    group = store.active_group
+    gs = store.groups[group]
+    samples = [s for b in gs.batches.values() for s in b.records
+               if load_start <= s.load <= load_end]
+    results = []
+    for no in range(1, ml.CHECKPOINT_COUNT + 1):
+        weights = store.registry[group][no - 1]["weights"]
+        if not samples:
+            results.append((no, None))
+            continue
+        sse = sum(
+            (ml.predict(weights, s.features) - s.measured) ** 2
+            for s in samples
+        )
+        results.append((no, sse / len(samples)))
+    calibrated = [(no, m) for no, m in results if m is not None]
+    if not calibrated:
+        return None
+    lo = min(m for _, m in calibrated)
+    winners = [(no, m) for no, m in calibrated
+               if m - lo <= ml.MSE_TIE_TOL]
+    no, mse = winners[0]
+    weights = store.registry[group][no - 1]["weights"]
+    return {
+        "checkpoint_no": no,
+        "mse": mse,
+        "prediction": ml.predict(weights, features),
+        "session_id": store.registry[group][no - 1]["session_id"],
+        "sample_count": len(samples),
+    }
 
 
-def test_brute_force_agreement_random_small_cases():
-    rng = random.Random(7)
-    checked = 0
-    for _ in range(120):
-        n = rng.randint(1, 6)
-        durs = [rng.randint(1, 5) for _ in range(n)]
-        ne = rng.randint(1, 2)
-        t = rng.randint(2, 12)
-        evs = []
-        for k in range(ne):
-            length = rng.randint(1, 3)
-            evs.append(EvaluationSpec(
-                k + 1, t, t + length, rng.randint(1, n)
-            ))
-            t += length + rng.randint(1, 12)
-        cp_lim = rng.randint(0, 3)
-        rr_lim = rng.randint(0, 8)
-
-        bf = brute_force(durs, evs, cp_lim, rr_lim)
-        res = solve(durs, evs, cp_lim, rr_lim)
-        assert res.feasible == bf[0], (durs, evs, cp_lim, rr_lim, bf)
-        if res.feasible:
-            # DFS 解的预算必须不劣于暴力最优。
-            assert res.reruns_total >= (bf[1] or 0)
-            assert res.checkpoints_used <= cp_lim
-            assert res.reruns_total <= rr_lim
-        checked += 1
-    assert checked == 120
+def _sample(no, load, feats, measured):
+    return {"sample_no": no, "load": load, "features": feats,
+            "measured": measured}
 
 
-def test_brute_force_agreement_handcrafted():
-    cases = [
-        ([3, 3, 3, 3], [EvaluationSpec(1, 11, 13, 1)], 2, 4),
-        ([2] * 8, [
-            EvaluationSpec(1, 10, 12, 4),
-            EvaluationSpec(2, 16, 18, 4),
-        ], 1, 1),
-        ([2] * 8, [
-            EvaluationSpec(1, 10, 12, 4),
-            EvaluationSpec(2, 16, 18, 4),
-        ], 1, 2),
-        ([5, 5], [EvaluationSpec(1, 9, 11, 1)], 1, 2),
-        ([4, 4, 4], [EvaluationSpec(1, 10, 13, 1)], 2, 5),
-    ]
-    for durs, evs, cp_lim, rr_lim in cases:
-        bf = brute_force(durs, evs, cp_lim, rr_lim)
-        res = solve(durs, evs, cp_lim, rr_lim)
-        assert res.feasible == bf[0], (durs, evs, cp_lim, rr_lim)
+def test_brute_force_matches_engine_across_intervals(store):
+    store.ingest_batch("b1", [
+        _sample(1, 100, [1, 2, 3, 4], 7),
+        _sample(2, 250, [-1, -2, -3, -4], -7),
+        _sample(3, 400, [10, -10, 0, 5], 3),
+        _sample(4, 900, [7, 7, -7, -7], 40),
+    ])
+    store.ingest_batch("b2", [
+        _sample(1, 150, [0, 1, 2, 3], -3),
+        _sample(2, 600, [50, -50, 50, -50], 99),
+    ])
+
+    for start, end in [(0, 65535), (100, 400), (200, 300), (500, 1000),
+                       (100, 100), (899, 901)]:
+        feats = [3, -2, 1, 0]
+        expected = _brute_force_select(store, start, end, feats)
+        actual = store.infer(start, end, feats)
+        if expected is None:
+            assert actual["status"] == "uncalibrated"
+            assert actual["summaries_read"] == 16
+            continue
+        assert actual["status"] == "ok"
+        assert actual["checkpoint_no"] == expected["checkpoint_no"]
+        assert math.isclose(actual["mse"], expected["mse"],
+                            rel_tol=1e-12, abs_tol=1e-12)
+        assert math.isclose(actual["prediction"], expected["prediction"],
+                            rel_tol=1e-12, abs_tol=1e-12)
+        assert actual["session_id"] == expected["session_id"]
+        assert actual["summaries_read"] == 16
+        assert actual["candidate_count"] >= 1
+
+
+def test_brute_force_matches_after_cross_segment_correction(store):
+    store.ingest_batch("b1", [_sample(1, 100, [1, 1, 1, 1], 5)])
+    store.correct_sample("b1", _sample(1, 800, [2, 2, 2, 2], -5))
+
+    # 旧区间：暴力视角也无样本。
+    assert _brute_force_select(store, 50, 150, [1, 1, 1, 1]) is None
+    # 新区间：两侧算法一致。
+    expected = _brute_force_select(store, 700, 900, [2, 2, 2, 2])
+    actual = store.infer(700, 900, [2, 2, 2, 2])
+    assert actual["checkpoint_no"] == expected["checkpoint_no"]
+    assert math.isclose(actual["mse"], expected["mse"],
+                        rel_tol=1e-12, abs_tol=1e-12)
+
+
+def test_brute_force_matches_after_group_swap(store):
+    store.ingest_batch("b1", [_sample(1, 300, [1, -1, 1, -1], 9)])
+    store.begin_swap("group_b")
+    store.commit_swap()
+    # 新组未校准。
+    assert _brute_force_select(store, 0, 65535, [1, 1, 1, 1]) is None
+    store.ingest_batch("b2", [_sample(2, 300, [4, 3, 2, 1], -8)])
+    expected = _brute_force_select(store, 0, 65535, [4, 3, 2, 1])
+    actual = store.infer(0, 65535, [4, 3, 2, 1])
+    assert actual["group"] == "group_b"
+    assert actual["checkpoint_no"] == expected["checkpoint_no"]
+    assert math.isclose(actual["mse"], expected["mse"],
+                        rel_tol=1e-12, abs_tol=1e-12)

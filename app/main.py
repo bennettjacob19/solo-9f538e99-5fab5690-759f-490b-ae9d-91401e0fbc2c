@@ -1,138 +1,134 @@
-"""FastAPI 入口：本地单卡夜班训练 + 定时评测演练。
+"""FastAPI 入口：训练检查点功耗偏差校准与区间选档推理服务。
 
 端点：
-* ``POST /plans``          提交排程请求；有解才创建演练会话，无解不启动
-* ``GET  /sessions``       列出会话
-* ``GET  /sessions/{id}``  查询模拟时钟与已执行时段
-* ``POST /sessions/{id}/advance``  推进模拟时钟，重放训练/存档/评测
-* ``GET  /sessions/{id}/results``  最终权重与不间断训练一致性结论
-* ``GET  /docs``           Swagger UI（自动生成）
+* ``POST /calibration/batches``           分批录入校准记录
+* ``POST /calibration/corrections``       同批同号整条更正（含跨负载段）
+* ``POST /inference``                     区间均方误差选档并预测
+* ``POST /candidate-groups/swap``         候选组整组更换：准备
+* ``POST /candidate-groups/swap/commit``  提交换组
+* ``POST /candidate-groups/swap/abort``   撤除换组准备
+* ``GET  /docs``                          1～16 号检查点登记册（业务语义）
+* ``GET  /state``                         当前校准状态总览
+* ``GET  /health``                        健康检查
+
+``/openapi.json`` 保留机器可读的接口描述；Swagger UI 让位给业务登记册。
 """
 
 from __future__ import annotations
 
 import os
-import uuid
-from contextlib import asynccontextmanager
 
-import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from . import ml
-from .schemas import PlanRequest
-from .scheduler import EvaluationSpec, solve
-from .simulator import Session
+from .calibration import CalibrationError, CalibrationStore
+from .schemas import (
+    BatchRequest,
+    CorrectionRequest,
+    InferenceRequest,
+    SwapBeginRequest,
+)
 
 DATA_DIR = os.environ.get("APP_DATA_DIR", os.path.join(os.getcwd(), "sessions_data"))
+LIBRARY_DIR = os.path.join(DATA_DIR, "checkpoint_library")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-SESSIONS: dict[str, Session] = {}
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    # 内存会话随进程结束；检查点文件保留在 DATA_DIR 供核查。
-
+# 启动时确保两组各 16 份检查点就位（确定性生成，幂等）。
+REGISTRY = ml.ensure_library(LIBRARY_DIR)
+STORE = CalibrationStore(DATA_DIR, REGISTRY)
 
 app = FastAPI(
-    title="单卡夜班训练与定时评测演练",
-    version="1.0.0",
+    title="训练检查点功耗偏差校准与选档推理",
+    version="2.0.0",
     description=(
-        "提交至多 24 批训练耗时、至多 4 场互不重叠评测及检查点/重跑预算，"
-        "求解器在满足全部独占与续训约束时受理并启动确定性模拟；"
-        "推进模拟时钟可查实跑时段、重跑批数与推理结果，最终权重与"
-        "不间断训练逐元素一致。"
+        "16 份训练检查点按档号登记；分批录入整数校准样本，按当前负载段"
+        "实测均方误差选权重预测设备功耗偏差。支持同批同号跨段更正与"
+        "候选组整组更换，更正/换组失败时保留已生效状态。"
     ),
-    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
 )
 
 
-@app.post("/plans", status_code=201)
-def create_plan(req: PlanRequest) -> dict:
-    specs = [
-        EvaluationSpec(
-            eval_id=e.eval_id,
-            start=e.start,
-            end=e.end,
-            min_checkpoint_batches=e.min_checkpoint_batches,
-        )
-        for e in req.evaluations
-    ]
-    result = solve(
-        durations=list(req.durations),
-        evaluations=specs,
-        max_checkpoints=req.max_checkpoints,
-        max_rerun_batches=req.max_rerun_batches,
-    )
-    if not result.feasible:
-        # 无解不启动：不创建任何会话/目录，返回 422 说明原因。
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "accepted": False,
-                "message": "无满足限制的排法，演练未启动",
-                "reasons": result.reasons,
-            },
-        )
-
-    session_id = uuid.uuid4().hex[:12]
-    session = Session(
-        session_id=session_id,
-        plan=result,
-        data_dir=DATA_DIR,
-        num_batches=len(req.durations),
-    )
-    SESSIONS[session_id] = session
-    return {
-        "accepted": True,
-        "session_id": session_id,
-        "checkpoints_used": result.checkpoints_used,
-        "reruns_total": result.reruns_total,
-        "makespan": result.makespan,
-        "segments": [s.as_dict() for s in result.segments],
-    }
-
-
-@app.get("/sessions")
-def list_sessions() -> dict:
-    return {
-        "sessions": [
-            {"session_id": sid, **{k: v for k, v in s.status().items()
-                                   if k != "session_id"}}
-            for sid, s in sorted(SESSIONS.items())
-        ]
-    }
-
-
-@app.get("/sessions/{session_id}")
-def get_session(session_id: str) -> dict:
-    session = _require_session(session_id)
-    return session.status()
-
-
-@app.post("/sessions/{session_id}/advance")
-def advance_clock(session_id: str, seconds: int) -> dict:
-    session = _require_session(session_id)
-    if seconds <= 0:
-        raise HTTPException(status_code=400, detail="seconds 必须为正整数")
-    return session.advance(seconds)
-
-
-@app.get("/sessions/{session_id}/results")
-def get_results(session_id: str) -> dict:
-    session = _require_session(session_id)
-    out = session.results()
-    out["session_id"] = session_id
-    return out
+@app.exception_handler(CalibrationError)
+async def _calibration_error_handler(_request, exc: CalibrationError):
+    # 业务状态冲突/校验失败：409，且引擎保证抛出前未改动已生效状态。
+    return JSONResponse(status_code=409,
+                        content={"accepted": False, "message": str(exc)})
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "numpy": np.__version__}
+    return {"status": "ok", "checkpoint_groups": list(REGISTRY.keys())}
 
 
-def _require_session(session_id: str) -> Session:
-    if session_id not in SESSIONS:
-        raise HTTPException(status_code=404, detail="会话不存在或未受理")
-    return SESSIONS[session_id]
+@app.get("/docs")
+def docs_registry() -> dict:
+    """1～16 号检查点登记册（按登记顺序），含会话号、权重与校准概况。"""
+    return STORE.registry_docs()
+
+
+@app.get("/state")
+def state_overview() -> dict:
+    return STORE.overview()
+
+
+@app.post("/calibration/batches", status_code=201)
+def ingest_batch(req: BatchRequest) -> dict:
+    payload = [s.model_dump() for s in req.samples]
+    try:
+        return STORE.ingest_batch(req.batch_id, payload)
+    except CalibrationError as exc:
+        raise HTTPException(status_code=409, detail={
+            "accepted": False, "message": str(exc),
+        })
+
+
+@app.post("/calibration/corrections")
+def correct_sample(req: CorrectionRequest) -> dict:
+    try:
+        return STORE.correct_sample(req.batch_id, req.sample.model_dump())
+    except CalibrationError as exc:
+        raise HTTPException(status_code=409, detail={
+            "accepted": False, "message": str(exc),
+        })
+
+
+@app.post("/inference")
+def inference(req: InferenceRequest) -> dict:
+    result = STORE.infer(req.load_start, req.load_end, list(req.features))
+    if result.get("status") == "uncalibrated":
+        # 区间无样本：业务上明确报“未校准”，HTTP 层仍为 200 并给出原因。
+        result["accepted"] = False
+    return result
+
+
+@app.post("/candidate-groups/swap")
+def begin_swap(req: SwapBeginRequest) -> dict:
+    try:
+        return STORE.begin_swap(req.target_group)
+    except CalibrationError as exc:
+        raise HTTPException(status_code=409, detail={
+            "accepted": False, "message": str(exc),
+        })
+
+
+@app.post("/candidate-groups/swap/commit")
+def commit_swap() -> dict:
+    try:
+        return STORE.commit_swap()
+    except CalibrationError as exc:
+        raise HTTPException(status_code=409, detail={
+            "accepted": False, "message": str(exc),
+        })
+
+
+@app.post("/candidate-groups/swap/abort")
+def abort_swap() -> dict:
+    try:
+        return STORE.abort_swap()
+    except CalibrationError as exc:
+        raise HTTPException(status_code=409, detail={
+            "accepted": False, "message": str(exc),
+        })

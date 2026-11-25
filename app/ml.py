@@ -1,131 +1,126 @@
-"""确定性的 NumPy 微型线性回归训练/推理逻辑。
+"""检查点权重的落盘、加载与检查点库生成。
 
-所有数据由固定种子按批次生成，任何一次重跑同一批次得到的权重更新
-与首次完全一致，从而保证“被评测打断后重跑”的最终权重与不间断训练
-逐元素相同。
+每个检查点是一个 ``.npz`` 文件，内含：
+
+* ``weights``：5 个 float64 权重，依次为四项特征系数与偏置；
+* ``checkpoint_id``：档号（1～16）；
+* ``group``：所属候选组标识；
+* ``session_id``：训练会话号（12 位十六进制）。
+
+检查点库按 ``<data_dir>/checkpoint_library/<group>/<session_id>/checkpoint_xxx.npz``
+组织，组内恰好 16 档，按档号顺序登记。
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 
 import numpy as np
 
-# 固定的全局随机种子，保证每次启动服务得到完全一致的批次数据。
-SEED = 20261124
 INPUT_DIM = 4
-# 每个批次的样本数。
-BATCH_SIZE = 8
-# 线性回归的学习率。
-LEARNING_RATE = 0.05
+# 权重向量 = 四项特征系数 + 偏置。
+WEIGHT_DIM = INPUT_DIM + 1
+CHECKPOINT_COUNT = 16
+WEIGHT_DTYPE = np.float64
+# 负载的合法范围。
+LOAD_MIN = 0
+LOAD_MAX = 65535
+# 特征与实测值的合法范围。
+VALUE_MIN = -100
+VALUE_MAX = 100
+# MSE 并列容差：与最低 MSE 相差不超过该值即视为并列。
+MSE_TIE_TOL = 1e-9
+# 选档最多读取的区间汇总条数（16 档 < 40，天然满足）。
+MAX_SUMMARIES_READ = 40
 
-_WEIGHT_DTYPE = np.float64
-
-
-def rng_for_batch(batch_index: int) -> np.random.Generator:
-    """每个批次使用独立、确定的随机流，重跑与首跑完全一致。"""
-    return np.random.default_rng(SEED + batch_index * 7919)
-
-
-def make_batch(batch_index: int) -> tuple[np.ndarray, np.ndarray]:
-    """生成第 ``batch_index`` 个训练批次（0 基），返回 (X, y)。"""
-    rng = rng_for_batch(batch_index)
-    x = rng.normal(size=(BATCH_SIZE, INPUT_DIM))
-    true_w = np.linspace(1.0, 2.0, INPUT_DIM)
-    noise = rng.normal(scale=0.01, size=BATCH_SIZE)
-    y = x @ true_w + 0.5 + noise
-    return x, y
+# 固定库种子，保证任何环境下生成的两组检查点逐元素一致。
+LIBRARY_SEED = 20261125
 
 
-def initial_weights() -> np.ndarray:
-    """固定的初始权重（含偏置项）。"""
-    rng = np.random.default_rng(SEED)
-    return rng.normal(scale=0.1, size=INPUT_DIM + 1).astype(_WEIGHT_DTYPE).copy()
+def checkpoint_path(library_dir: str, group: str, session_id: str,
+                    checkpoint_no: int) -> str:
+    return os.path.join(
+        library_dir, group, session_id, f"checkpoint_{checkpoint_no:03d}.npz"
+    )
 
 
-def _augment(x: np.ndarray) -> np.ndarray:
-    ones = np.ones((x.shape[0], 1), dtype=x.dtype)
-    return np.hstack([x, ones])
+def save_checkpoint(path: str, weights: np.ndarray, checkpoint_id: int,
+                    group: str, session_id: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez(
+        path,
+        weights=np.asarray(weights, dtype=WEIGHT_DTYPE),
+        checkpoint_id=np.int64(checkpoint_id),
+        group=np.asarray(group),
+        session_id=np.asarray(session_id),
+    )
 
 
-def train_one_batch(weights: np.ndarray, batch_index: int) -> np.ndarray:
-    """对一批样本做一次全批梯度下降，返回更新后的权重（不修改入参）。
-
-    损失为均方误差，梯度按闭式公式计算，纯 NumPy 运算且无随机性，
-    因此相同权重 + 相同批次必然得到相同结果。
-    """
-    x, y = make_batch(batch_index)
-    phi = _augment(x)
-    pred = phi @ weights
-    grad = (2.0 / x.shape[0]) * (phi.T @ (pred - y))
-    return (weights - LEARNING_RATE * grad).astype(_WEIGHT_DTYPE, copy=True)
-
-
-def predict(weights: np.ndarray, x: np.ndarray) -> np.ndarray:
-    return _augment(x) @ weights
-
-
-def evaluation_dataset() -> tuple[np.ndarray, np.ndarray]:
-    """评测专用的固定数据集，所有场次使用同一数据集便于横向比较。"""
-    rng = np.random.default_rng(SEED ^ 0x5EED)
-    x = rng.normal(size=(16, INPUT_DIM))
-    true_w = np.linspace(1.0, 2.0, INPUT_DIM)
-    y = x @ true_w + 0.5 + rng.normal(scale=0.01, size=16)
-    return x, y
-
-
-def run_inference(weights: np.ndarray) -> dict:
-    """用给定权重在固定评测集上推理，返回预测值与 MSE。"""
-    x, y = evaluation_dataset()
-    preds = predict(weights, x)
-    mse = float(np.mean((preds - y) ** 2))
-    return {
-        "mse": mse,
-        "predictions": [float(v) for v in preds],
-        "targets": [float(v) for v in y],
-    }
-
-
-def reference_uninterrupted(num_batches: int) -> np.ndarray:
-    """不间断训练全部批次得到的参考权重（用于一致性校验）。"""
-    w = initial_weights()
-    for b in range(num_batches):
-        w = train_one_batch(w, b)
-    return w
-
-
-@dataclass
-class Checkpoint:
-    """内存中的检查点状态；同时落盘一份 .npz 作为本地检查点证据。"""
-
-    checkpoint_id: int
-    batches_trained: int
-    weights: np.ndarray
-    path: str
-
-    def to_summary(self) -> dict:
+def load_checkpoint(path: str) -> dict:
+    """加载检查点，返回权重与登记信息。"""
+    with np.load(path, allow_pickle=False) as data:
         return {
-            "checkpoint_id": self.checkpoint_id,
-            "batches_trained": self.batches_trained,
-            "path": self.path,
+            "weights": data["weights"].astype(WEIGHT_DTYPE, copy=True),
+            "checkpoint_id": int(data["checkpoint_id"]),
+            "group": str(data["group"]),
+            "session_id": str(data["session_id"]),
         }
 
 
-def save_checkpoint(
-    directory: str, checkpoint_id: int, batches_trained: int, weights: np.ndarray
-) -> Checkpoint:
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, f"checkpoint_{checkpoint_id:03d}.npz")
-    np.savez(
-        path,
-        weights=weights,
-        batches_trained=np.int64(batches_trained),
-        checkpoint_id=np.int64(checkpoint_id),
+def predict(weights: np.ndarray, features: list[int]) -> float:
+    """四项整数特征 + 常数偏置项的线性预测。"""
+    if len(features) != INPUT_DIM:
+        raise ValueError("特征必须恰好四项")
+    phi = np.asarray(list(features) + [1.0], dtype=WEIGHT_DTYPE)
+    return float(phi @ np.asarray(weights, dtype=WEIGHT_DTYPE))
+
+
+def _session_id_for(group_index: int, checkpoint_no: int) -> str:
+    """由组序号与档号确定性派生 12 位十六进制会话号。"""
+    seed = LIBRARY_SEED + group_index * 1009 + checkpoint_no * 37
+    rng = np.random.default_rng(seed)
+    token = rng.integers(0, 16**12, dtype=np.int64)
+    return f"{int(token):012x}"
+
+
+def _weights_for(group_index: int, checkpoint_no: int) -> np.ndarray:
+    """确定性生成某组某档的权重；不同组、不同档权重互不相同。"""
+    rng = np.random.default_rng(
+        LIBRARY_SEED ^ (group_index * 7919 + checkpoint_no * 104729)
     )
-    return Checkpoint(checkpoint_id, batches_trained, weights.copy(), path)
+    # 系数落在量级合理的区间，偏置单独一个尺度，便于人工核对。
+    coef = rng.uniform(-2.0, 2.0, size=INPUT_DIM)
+    bias = rng.uniform(-5.0, 5.0)
+    return np.concatenate([coef, [bias]]).astype(WEIGHT_DTYPE)
 
 
-def load_checkpoint(path: str) -> tuple[np.ndarray, int]:
-    with np.load(path) as data:
-        return data["weights"].copy(), int(data["batches_trained"])
+def ensure_library(library_dir: str,
+                   groups: tuple[str, ...] = ("group_a", "group_b")) -> dict:
+    """确保检查点库存在；缺失时按固定种子确定性生成。
+
+    返回登记册：``{group: [{checkpoint_no, session_id, path, weights}, ...]}``，
+    每组严格按 1～16 顺序登记。
+    """
+    registry: dict[str, list[dict]] = {}
+    for gi, group in enumerate(groups):
+        entries: list[dict] = []
+        for no in range(1, CHECKPOINT_COUNT + 1):
+            session_id = _session_id_for(gi, no)
+            path = checkpoint_path(library_dir, group, session_id, no)
+            if not os.path.exists(path):
+                save_checkpoint(
+                    path, _weights_for(gi, no), no, group, session_id
+                )
+            info = load_checkpoint(path)
+            if info["checkpoint_id"] != no or info["group"] != group \
+                    or info["session_id"] != session_id:
+                raise RuntimeError(f"检查点库文件内容与登记不符: {path}")
+            entries.append({
+                "checkpoint_no": no,
+                "session_id": session_id,
+                "group": group,
+                "path": path,
+                "weights": info["weights"],
+            })
+        registry[group] = entries
+    return registry
